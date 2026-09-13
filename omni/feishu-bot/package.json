@@ -1,0 +1,17 @@
+{
+	"name": "@omni/feishu-bot",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Feishu (飞书) bot bridge for the pi coding agent — OmniTeam omni branch",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"start": "node main.mjs",
+		"self-test": "node main.mjs --self-test"
+	},
+	"dependencies": {
+		"@larksuiteoapi/node-sdk": "^1.71.0"
+	}
+}

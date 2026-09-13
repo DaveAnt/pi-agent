@@ -398,6 +398,10 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.UNEXPECTED_TOOL_CALL:
 		case FinishReason.NO_IMAGE:
 			return "error";
+		case FinishReason.TOO_MANY_TOOL_CALLS:
+			// System exited after too many consecutive tool calls — the turn was
+			// terminated by the platform, not the model. Mirrors MAX_TOKENS.
+			return "length";
 		default: {
 			const _exhaustive: never = reason;
 			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
@@ -413,6 +417,7 @@ export function mapStopReasonString(reason: string): StopReason {
 		case "STOP":
 			return "stop";
 		case "MAX_TOKENS":
+		case "TOO_MANY_TOOL_CALLS":
 			return "length";
 		default:
 			return "error";

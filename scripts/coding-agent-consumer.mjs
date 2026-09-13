@@ -8,11 +8,14 @@ import { fileURLToPath } from "node:url";
 import { getPublicWorkspacePackages } from "./release-packages.mjs";
 
 const codingAgentName = "@earendil-works/pi-coding-agent";
-const developmentPackages = new Set(["pi-client", "pi-protocol", "pi-server"].map((name) => `@earendil-works/${name}`));
+const developmentPackages = new Set(["pi-client", "pi-protocol"].map((name) => `@earendil-works/${name}`));
 
 function run(command, args, options = {}) {
 	console.log(`$ ${[command, ...args].join(" ")}`);
-	const result = spawnSync(command, args, {
+	// Windows: with shell: true cmd.exe splits on spaces, so quote an absolute
+	// command path containing spaces (e.g. "C:\Program Files\nodejs\node.exe").
+	const executable = /^[A-Za-z]:[\\/]/.test(command) && command.includes(" ") ? `"${command}"` : command;
+	const result = spawnSync(executable, args, {
 		encoding: "utf8",
 		shell: process.platform === "win32",
 		timeout: 300_000,
@@ -105,9 +108,12 @@ import { createAgentSession, SessionManager, ModelRuntime } from "${codingAgentN
 assert.equal(typeof createAgentSession, "function");
 assert.equal(typeof SessionManager.inMemory, "function");
 assert.equal(typeof ModelRuntime.create, "function");
-for (const name of ["pi-client", "pi-protocol", "pi-server"]) {
+for (const name of ["pi-client", "pi-protocol"]) {
   assert.throws(() => import.meta.resolve("@earendil-works/" + name), /Cannot find|cannot find/, name + " must not be installed");
 }
+// pi-server is a declared runtime dependency of the coding agent (experimental/server.ts
+// and friends import it), so it must resolve from a consumer install.
+assert.doesNotThrow(() => import.meta.resolve("@earendil-works/pi-server"), "pi-server must be installed");
 for (const subpath of ["/client", "/experimental/plugin"]) {
   assert.throws(() => import.meta.resolve("${codingAgentName}" + subpath), /not exported|not defined|Cannot find|cannot find/);
 }

@@ -6,12 +6,12 @@ import test from "node:test";
 import { installCodingAgentConsumer, packReleasePackages, smokeTestCodingAgentConsumer } from "./coding-agent-consumer.mjs";
 
 const codingAgentName = "@earendil-works/pi-coding-agent";
-const devPackages = ["pi-client", "pi-protocol", "pi-server"].map((name) => `@earendil-works/${name}`);
+const devPackages = ["pi-client", "pi-protocol"].map((name) => `@earendil-works/${name}`);
 
-function createFixture(t, { importServer = false, declareServer = false } = {}) {
+function createFixture(t, { importServer = false } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-consumer-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const packages = [codingAgentName, "@earendil-works/chord", ...devPackages].map((name) => ({
+	const packages = [codingAgentName, "@earendil-works/chord", ...devPackages, "@earendil-works/pi-server"].map((name) => ({
 		name,
 		directory: join(root, "packages", name.split("/")[1]),
 	}));
@@ -30,7 +30,7 @@ function createFixture(t, { importServer = false, declareServer = false } = {}) 
 				bin: { pi: "dist/bundle/cli.js" },
 				dependencies: {
 					"@earendil-works/chord": "1.0.0",
-					...(declareServer ? { "@earendil-works/pi-server": "1.0.0" } : {}),
+					"@earendil-works/pi-server": "1.0.0",
 				},
 				devDependencies: Object.fromEntries(devPackages.map((name) => [name, "1.0.0"])),
 			} : {}),
@@ -72,24 +72,19 @@ test("installs only coding-agent directly and uses overrides only for declared r
 	}
 	smokeTestCodingAgentConsumer(directory);
 
-	const nested = join(directory, "node_modules", codingAgentName, "node_modules/@earendil-works/pi-server");
-	mkdirSync(nested, { recursive: true });
-	writeFileSync(join(nested, "package.json"), JSON.stringify({ name: "@earendil-works/pi-server", version: "1.0.0" }));
-	assert.throws(() => smokeTestCodingAgentConsumer(directory), /pi-server must not be installed/);
-	rmSync(nested, { recursive: true });
-
 	const experimental = join(directory, "node_modules", codingAgentName, "dist/experimental");
 	mkdirSync(experimental);
 	assert.throws(() => smokeTestCodingAgentConsumer(directory), /contains development-only code/);
 });
 
 // #9132: smoke-test the public SDK, not just a bundled CLI that hides missing imports.
-test("fails when the SDK imports an undeclared server despite a working CLI", (t) => {
+// pi-server is a declared runtime dependency, so a consumer importing it must install cleanly.
+test("resolves the declared pi-server runtime dependency from the consumer SDK", (t) => {
 	const directory = createFixture(t, { importServer: true });
-	assert.throws(() => smokeTestCodingAgentConsumer(directory), /Cannot find package '@earendil-works\/pi-server'/);
+	assert.doesNotThrow(() => smokeTestCodingAgentConsumer(directory));
 });
 
-test("fails if a development-only dependency is added back to the published dependency tree", (t) => {
-	const directory = createFixture(t, { declareServer: true });
-	assert.throws(() => smokeTestCodingAgentConsumer(directory), /pi-server must not be installed/);
+test("accepts pi-server as a declared runtime dependency of the published tree", (t) => {
+	const directory = createFixture(t);
+	assert.doesNotThrow(() => smokeTestCodingAgentConsumer(directory));
 });

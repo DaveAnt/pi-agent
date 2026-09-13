@@ -670,7 +670,9 @@ export function hyperlink(text: string, url: string): string {
 function shortenImagePath(filename: string): string {
 	const home = homedir();
 	if (home && (filename === home || filename.startsWith(`${home}/`) || filename.startsWith(`${home}\\`))) {
-		return `~${filename.slice(home.length)}`;
+		// Normalize separators: ~/... is both the documented display form and the
+		// portable prefix for OSC 8 file:// links (Windows drives produce `\`).
+		return `~${filename.slice(home.length).replaceAll("\\", "/")}`;
 	}
 	return filename;
 }
