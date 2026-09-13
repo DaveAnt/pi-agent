@@ -107,6 +107,7 @@ export type {
 	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
+	NormalizedBuildSystemPromptOptions,
 	PowerShellToolCallEvent,
 	ProjectTrustContext,
 	ProjectTrustEvent,
