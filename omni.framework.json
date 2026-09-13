@@ -1,0 +1,24 @@
+{
+  "id": "pi-agent",
+  "name": "Pi Agent",
+  "version": "0.85.1",
+  "icon": "🥧",
+  "description": "earendil-works pi —— 高性能 TypeScript Agent 框架（统一 LLM API、agent 循环、技能、沙箱）。经 pi --mode rpc（JSONL）驱动，每智能体一条持久会话。",
+  "adapter": "pi-rpc",
+  "capabilities": {
+    "streaming": true,
+    "tools": true,
+    "tasks": true
+  },
+  "sessionDir": "omni/sessions",
+  "piHome": "omni/pi-home",
+  "launch": {
+    "command": "node",
+    "args": ["packages/coding-agent/dist/bundle/cli.js"],
+    "cwd": ".",
+    "readyTimeoutMs": 20000
+  },
+  "env": {
+    "OMNI_LLM_MODEL": "omni-default"
+  }
+}
