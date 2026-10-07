@@ -43,3 +43,6 @@ plans/
 .pi/hf-sessions-backup/
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md
+
+# OmniTeam 本地运行时 home（模型配置/身份状态，机器相关）
+omni/pi-home/
