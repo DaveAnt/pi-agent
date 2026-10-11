@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `authorizeMcp()` exchanging an authorization code whose `iss` parameter could not be checked because no authorization server metadata was discovered. It now throws `OAuthIssuerMismatchError`, whose `expected` is `undefined` in that case (RFC 9207). Reported by [@AizenvoltPrime](https://github.com/AizenvoltPrime)
+
+## [1.1.0] - 2026-10-07
+
 ### Added
 
 - Added a `signal` option to `authorizeMcp()`, `registerClient()`, the token request functions, and the discovery functions, which aborts their requests. An aborted refresh no longer falls back to a new authorization ([#10565](https://github.com/earendil-works/pi/issues/10565))

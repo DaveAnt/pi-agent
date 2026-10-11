@@ -4,6 +4,24 @@
 
 ### Breaking Changes
 
+- `Editor.render()` and `Input.render()` now wrap the drawn cursor in zero-width APC markers instead of emitting `\x1b[7m` directly. TUI renderers resolve them; code that renders these components outside a TUI must strip them, for example with `stripTerminalSequences()`
+
+### Added
+
+- Added `renderFakeCursor()`. Components wrap their drawn cursor with it, and the TUI renders it in reverse video, or omits it after `CURSOR_MARKER` when `showHardwareCursor` is enabled
+
+### Changed
+
+- Changed `showHardwareCursor` to show only the terminal cursor: focused `Editor` and `Input` components no longer draw a reverse-video cursor when it is enabled. This avoids terminals that extend edge cell colors into the window padding stretching the drawn cursor at the first or last column
+
+### Fixed
+
+- Fixed overlay compositing dropping `CURSOR_MARKER` when an overlay ends directly left of the cursor, which lost the hardware cursor position
+
+## [1.1.0] - 2026-10-07
+
+### Breaking Changes
+
 - `Terminal` implementations must provide `setProgramStatus(status)`; a terminal without OSC 7501 support can implement it as a no-op ([#10607](https://github.com/earendil-works/pi/issues/10607))
 
 ### Added
