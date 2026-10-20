@@ -1,7 +1,7 @@
-# Pico5 specification
+# Durable specification
 
-Pico5 is a durable, extensible agent harness. This document is normative.
-Pico5 uses existing package types as follows:
+`@earendil-works/pi-durable` is a durable, extensible agent harness. This document is normative.
+It uses existing package types as follows:
 
 ```ts
 import type {
@@ -34,7 +34,7 @@ type JsonObject = { [key: string]: JsonValue };
 type TaskOutcomeError = { message: string; detail?: JsonValue };
 ```
 
-Pico5 targets the transcript `SystemMessage` contract from pi-ai PR
+Durable targets the transcript `SystemMessage` contract from pi-ai PR
 [#9548](https://github.com/earendil-works/pi/pull/9548). `Message` includes that
 type once the PR lands.
 
@@ -137,7 +137,7 @@ string adds or replaces a section, while `null` removes it. `toolsRemoved` is
 applied before `toolsAdded` within one message. Replaying every system message
 in transcript order yields the effective prompt and tool set.
 
-Pico always writes `content: ""`. Every prompt part, including the preamble, is
+Durable always writes `content: ""`. Every prompt part, including the preamble, is
 a named section resolved from the conversation's agent (section 7.4).
 
 ```ts
@@ -281,13 +281,25 @@ Context derivation:
    fork cut or at an interrupted tail. Drop tool results with no preceding call.
 9. Exclude model-less entries and assistant messages with `aborted`, `error`, or
    `deferred` stop reasons from future provider requests.
-10. Move a system message that only user messages precede to the front. A
-    run's input is committed before generation renders the system prompt, so a
-    transcript, or the range after a compaction or reset, otherwise starts with
-    the input. Providers treat only a leading system message as the initial
-    prompt and tool set; without one, a later tool change rewrites the
-    request's tool list and invalidates the whole prompt cache. Stored entries
-    and `contributions` keep the committed order.
+10. Move the first system message to the front when only user messages
+    precede it, or when it is the baseline's: the first `pi.system` entry after
+    `H`, unless an edit targets it. Generation writes it with every section and
+    tool in effect before the first request after a compaction or reset, and
+    omits the retained `pi.system` entries. Without `H`, the first `pi.system`
+    entry is the baseline unless an earlier entry carries a system message, in
+    its messages or an edit's replacement, even one an edit omits later: only
+    then did generation write it with every section and tool in effect, before
+    the first request or once an agent without any gets one. A run's input
+    is committed before generation renders the system prompt, so the context
+    otherwise starts with the input, or with the kept history, assistant
+    messages included. Providers treat only a leading system message as the
+    initial prompt and tool set; without one, a later tool change rewrites the
+    request's tool list and invalidates the whole prompt cache. Only the first
+    system message moves, so replay gives the same sections and tools. Any other
+    system message with an assistant message before it stays in place, since
+    moving it would change what it means; a retained system message of another
+    kind ahead of the baseline therefore keeps the baseline from leading.
+    Stored entries and `contributions` keep the committed order.
 
 Views carry raw active entries. UI reduction and model-context reduction are
 separate consumers. Older stored history is available through the owning
@@ -295,9 +307,7 @@ separate consumers. Older stored history is available through the owning
 
 ### 2.2 Public Harness surface
 
-This is the v1 host-facing API. Pico5 is not implemented yet, but implementations
-must expose this shape rather than inventing a different facade during package
-24.
+This is the v1 host-facing API.
 
 ```ts
 type ModelRef = {
@@ -349,9 +359,11 @@ type AnyTask = {
 };
 
 type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
-  readonly models: Models; // the pi-ai Models interface
+  /** The pi-ai Models interface, or a function returning the current one, called at each use. */
+  readonly models: Models | (() => Models);
   readonly registry: RegistryReader<Tool>; // section 7.1
-  readonly settings?: HarnessSettings;
+  /** Run settings, or a function returning the current ones; read at each use either way. */
+  readonly settings?: HarnessSettings | (() => HarnessSettings | undefined);
   /** Builds a conversation's environment. Never called on the Session line; may be async. */
   readonly env?: (
     target: { readonly conversationId: ConversationId; readonly cwd?: string; readonly read: DocumentReader },
@@ -359,10 +371,31 @@ type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
   ) => ExecutionEnv | undefined | Promise<ExecutionEnv | undefined>;
   /** Runs in every commit that creates or forks a conversation, after the built-in creation hook (below). */
   readonly conversationCreated?: (tx: Tx, conversation: ConversationRecord) => void | Promise<void>;
-  /** Wall clock for sleeps, retries, message timestamps, and task lifecycle times. Default `Date.now`. */
+  /**
+   * Wall clock for sleeps, retries, message timestamps, and task lifecycle times, epoch milliseconds. Default
+   * `Date.now`. Sleeping tasks store deadlines on it, so every process that opens one storage uses one clock.
+   */
   readonly now?: () => number;
-  /** Failures that do not fail the calling operation, and the Session's failure, once (section 10.1). */
-  readonly onReport?: (error: unknown) => void;
+  /**
+   * Arms every timer of the Session and Harness (section 5.6). `background` timers only free memory and may be
+   * declined by returning `undefined`; the others pace or resume work. Default `setTimeout`, background timers
+   * unreferenced, or declined in Cloudflare Workers and where they cannot be unreferenced.
+   */
+  readonly setTimer?: (
+    callback: () => void,
+    delayMs: number,
+    options: { readonly background: boolean },
+  ) => (() => void) | undefined;
+  /**
+   * Replaces the timer for sleeping tasks (section 5.6): called with `Harness.wake()` after open and whenever it
+   * changes, off the Session line; the host arms its own wakeup and calls `resume()` when it fires.
+   */
+  readonly onWake?: (wake: Wake) => void;
+  /**
+   * Failures that do not fail the calling operation, and the Session's failure, once; `info` says where each came
+   * from (section 10.1).
+   */
+  readonly onReport?: (error: unknown, info: ReportInfo) => void;
 };
 
 /** Curated pi-ai request options; absent fields use pi-ai defaults. */
@@ -398,6 +431,14 @@ type CompactionPolicy = {
   backgroundTokens: number;
 };
 
+/**
+ * `modelOverrides` is keyed by exact `"provider/modelId"`; each field it sets replaces the harness-wide one for that
+ * model. Readers resolve the policy for the model they act for (see the reader table below).
+ */
+type CompactionSettings = Partial<CompactionPolicy> & {
+  readonly modelOverrides?: Readonly<Record<string, Partial<CompactionPolicy>>>;
+};
+
 type ToolExecutionMode = "parallel" | "sequential";
 
 /** How many queued items of one mode a boundary selects (section 6). */
@@ -409,7 +450,7 @@ type HarnessSettings = {
   readonly extensions?: readonly Extension[];
   readonly stream?: ConversationStreamOptions;
   readonly retry?: Partial<ConversationRetryPolicy>;
-  readonly compaction?: Partial<CompactionPolicy>;
+  readonly compaction?: CompactionSettings;
   readonly toolExecution?: ToolExecutionMode;
   readonly steeringMode?: QueueMode;
   readonly followUpMode?: QueueMode;
@@ -417,6 +458,10 @@ type HarnessSettings = {
   readonly contextRetentionMs?: number;
   /** How long a loaded document no watch or document state observes stays in memory after its last use (section 4). */
   readonly documentRetentionMs?: number;
+  /** What a failed run does with the inputs queued behind it (section 6). */
+  readonly afterFailedRun?: "keep" | "continue" | "withdraw";
+  /** Restarts in a row without progress after which a task is parked (section 5.4); `Infinity` never parks. */
+  readonly restartLimit?: number;
 };
 
 /** Resolved: every field over its built-in default, object fields merged. */
@@ -424,12 +469,14 @@ type Settings = {
   readonly extensions?: readonly Extension[]; // default: every installed extension, in install order
   readonly stream: ConversationStreamOptions; // default {}
   readonly retry: ConversationRetryPolicy; // { enabled: true, maxRetries: 3, baseDelayMs: 2000, maxAgentDelayMs: 60000 }
-  readonly compaction: CompactionPolicy; // { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000, backgroundTokens: 32768 }
+  readonly compaction: CompactionPolicy & Pick<CompactionSettings, "modelOverrides">; // { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000, backgroundTokens: 32768 }
   readonly toolExecution: ToolExecutionMode; // "parallel"
   readonly steeringMode: QueueMode; // "one-at-a-time"
   readonly followUpMode: QueueMode; // "one-at-a-time"
   readonly contextRetentionMs: number; // 600000
   readonly documentRetentionMs: number; // 600000
+  readonly afterFailedRun: "keep" | "continue" | "withdraw"; // "keep"
+  readonly restartLimit: number; // 5
 };
 
 /** Stored choices of one conversation; names, not objects. Unset fields follow the host. */
@@ -440,8 +487,12 @@ type AgentState = {
   extensions?: string[] | { add?: string[]; remove?: string[] };
   /** Filters the selected extensions' tools: the enabled tools. An array enables exactly these, in order. */
   tools?: string[] | { remove: string[] };
-  /** Filters the enabled tools the model may call: the tools it is offered. An array offers exactly these, in order. */
-  modelTools?: string[] | { remove: string[] };
+  /**
+   * Filters the enabled tools the model may call: the tools it is offered. Unset: all but deferred ones. An array:
+   * exactly these, in order, deferred ones too. An object: all but deferred ones and those in `remove`, in registry
+   * order, followed by the deferred tools in `add` that are not in `remove`, in `add` order.
+   */
+  modelTools?: string[] | { remove?: string[]; add?: string[] };
   /** Rendered after every extension section, as the section `instructions`. */
   instructions?: string;
   /** Directory within the environment's file system, passed to `HarnessOptions.env`. */
@@ -460,7 +511,10 @@ type AgentChange = {
     | { readonly add?: readonly Extension[]; readonly remove?: readonly Extension[] }
     | null;
   readonly tools?: readonly ToolRegistration[] | { readonly remove: readonly ToolRegistration[] } | null;
-  readonly modelTools?: readonly ToolRegistration[] | { readonly remove: readonly ToolRegistration[] } | null;
+  readonly modelTools?:
+    | readonly ToolRegistration[]
+    | { readonly remove?: readonly ToolRegistration[]; readonly add?: readonly ToolRegistration[] }
+    | null;
   readonly instructions?: string | null;
   readonly cwd?: string | null;
 };
@@ -477,6 +531,8 @@ type Agent<Tool extends ToolRegistration = ToolRegistration> = {
   readonly tools: readonly Tool[];
   /** Nested calls resolve among these: enabled, and `callers` includes `tools`. */
   readonly callable: readonly Tool[];
+  /** Enabled deferred tools the model may call and is not offered yet, in registry order. */
+  readonly deferred: readonly Tool[];
   /** Extension sections, then `instructions` when set. */
   readonly sections: readonly PromptSection<Tool>[];
   readonly instructions?: string;
@@ -526,14 +582,48 @@ type TaskInspection = {
     | { readonly kind: "running" }
     | { readonly kind: "ready"; readonly migrates: boolean }
     | { readonly kind: "waiting"; readonly on: readonly TaskId[] }
+    /** A sleep whose `until` the clock has not reached (section 5.6). */
+    | { readonly kind: "sleeping"; readonly until: number }
     /** Outcome held until its ordinary owned work drains (section 5.5). */
     | { readonly kind: "completing" }
     | {
         readonly kind: "blocked";
-        readonly reason: "missing_task" | "task_too_old" | "migration_failed";
+        readonly reason: "missing_task" | "task_too_old" | "migration_failed" | "restart_limit";
         readonly error?: unknown;
       };
 };
+
+/** When the Session next needs a running process (section 5.6). */
+type Wake = { readonly active: boolean; readonly at?: number };
+
+/** What a report is about (section 10.1). */
+type ReportTask = { readonly id: TaskId; readonly kind: string; readonly conversationId: ConversationId };
+type HostCallback = "now" | "settings" | "registry" | "env" | "models" | "setTimer" | "onWake";
+type ReportInfo =
+  | { readonly type: "session_failed" }
+  | {
+      readonly type: "task_faulted";
+      readonly task: ReportTask;
+      readonly extension?: string;
+      readonly reason: "threw" | "restart_limit";
+    }
+  | { readonly type: "task_parked"; readonly task: ReportTask; readonly extension?: string }
+  | { readonly type: "migration_failed"; readonly task: ReportTask; readonly extension?: string }
+  | {
+      readonly type: "task_outdated";
+      readonly task: ReportTask;
+      readonly extension?: string;
+      readonly reason: "missing_task" | "incompatible_task";
+    }
+  | { readonly type: "task_error"; readonly task: ReportTask; readonly extension?: string }
+  | {
+      readonly type: "extension_error";
+      readonly extension?: string;
+      readonly task?: ReportTask;
+      readonly conversationId?: ConversationId;
+    }
+  | { readonly type: "host_error"; readonly callback: HostCallback; readonly task?: ReportTask }
+  | { readonly type: "listener_error" };
 
 type HarnessInspection = {
   readonly scheduling: "paused" | "running" | "closing";
@@ -584,6 +674,8 @@ interface Conversation {
 
 interface Harness extends Session {
   resume(): void;
+  /** When the Session next needs a running process, from memory; also while paused (section 5.6). */
+  wake(): Wake;
 
   root(
     context: Context,
@@ -601,6 +693,8 @@ interface Harness extends Session {
     conversationId?: ConversationId,
   ): Promise<"aborted" | "already_placed" | "settled" | "not_found">;
   abortTask(id: TaskId, context: Context): Promise<"marked" | "terminal">;
+  /** Run a task parked by the restart limit again (section 5.4). */
+  retryTask(id: TaskId, context: Context): Promise<void>;
   waitForTask<R>(id: TaskId<R>, context: Context): Promise<SettledTask<R>>;
   waitForIdle(context: Context): Promise<void>;
   /** Session total of every conversation's `pi.usage` (section 8.6). */
@@ -619,10 +713,9 @@ declare const Harness: {
 };
 ```
 
-This intentionally retains the useful Pico3 host shape. It removes Pico3's
-fixed `rewindable()`/`sticky()` accessors, namespace router, semantic view events,
-and manual Chord view bridge. Typed Pico5 documents and the structural
-conversation watch replace those surfaces. `submit()` durably admits either a
+Typed documents and the structural conversation watch are the state surfaces;
+there are no fixed rewindable or sticky accessors, namespace router, semantic view
+events, or manual Chord view bridge. `submit()` durably admits either a
 user input or passive entry write and returns one `Submission` that tracks its
 settlement.
 
@@ -630,9 +723,9 @@ settlement.
 7.1). `createRegistry()` always holds the built-in task definitions (section 8),
 and open rejects a registry whose snapshot lacks any of them.
 Open changes surviving `running` tasks to `pending`, keeps `waiting` tasks
-waiting, and re-evaluates finalization and `failFast` for `completing` and
+waiting and `sleeping` tasks asleep, and re-evaluates finalization and `failFast` for `completing` and
 `waiting` tasks (section 5.5). It never migrates or terminalizes a task because
-its definition is missing or unmigratable. Such a task stays `pending` or `waiting` and is **blocked**: the
+its definition is missing or unmigratable. Such a task stays `pending`, `waiting`, or `sleeping` and is **blocked**: the
 scheduler skips it and reconsiders it whenever the registry changes (section
 5.4). Any built-in document touched by recovery migrates through its ordinary
 typed access path. Open does not scan or migrate other documents. No handler
@@ -648,8 +741,10 @@ the root already exists, `agent` and `init` are ignored and no write occurs.
 Reopen finds the same root by its reserved ID. A conversation whose agent has no
 model produces a durable `no_model` generation failure.
 
-`resume()` is idempotent while running and only enables scheduling. It does not
-repeat open-time reconciliation, and it throws after close. Work that must happen
+`resume()` is idempotent while running: it enables scheduling and makes sleeping
+tasks whose time has come runnable, which is how a host wakeup resumes them
+(section 5.6). It does not repeat open-time reconciliation, and it throws after
+close. Work that must happen
 before any task runs, such as installing extensions or seeding, happens before
 `resume()`. Calls that ask for progress also enable scheduling, so they never
 wait on a paused Harness: `Conversation.submit()`, `Conversation.compact()`,
@@ -793,8 +888,11 @@ selection, request options, retry, compaction thresholds, tool execution, and
 queue modes. Nothing copies or stores it. Every reader resolves it anew into
 `Settings`, each absent field over its built-in default and object fields merged
 key by key, and uses that value for one decision (section 7.1 lists the
-readers). A settings object with getters therefore follows the user's
-preferences without a Session write. Settings are synchronous because queue
+readers). A settings object with getters, or a `settings` function, therefore
+follows the user's preferences without a Session write. `models` works the same
+way: a function is called at each use (generation and compaction requests,
+`runtime.models`, `api.models` of hooks and tools at each access), so a host can
+replace its model configuration without reopening the Harness. Settings are synchronous because queue
 modes are read on the Session line. `stream` is forwarded to generation
 requests; `stream.maxRetries` are provider retries inside one request, while
 `retry` governs durable generation attempts (section 8.3). Settings changes make
@@ -842,6 +940,7 @@ keeps that in its own document and reads it through `target.read`:
 const ContainerDoc = defineDoc<{ image: string }>({
   kind: "app.container", version: 1, scope: "conversation", history: "latest", fork: "current",
   initial: () => ({ image: "node:22" }),
+  checkpointWhen: () => false,
 });
 const harness = await Harness.open(storage, {
   models,
@@ -928,7 +1027,8 @@ enable scheduling, and runs no task code. Each live task carries its state
 under the current registry: `running` with an active invocation; `completing`
 for a held outcome; `waiting` with the live tasks it still waits for, the live
 part of its `on`, or, when abort-marked, its live ordinary owned work (section
-5.5); `ready` when the next scheduling pass would reserve it, with `migrates`
+5.5); `sleeping` with its `until` while the clock has not reached it (section
+5.6); `ready` when the next scheduling pass would reserve it, with `migrates`
 when its definition is newer and has `migrate`; or `blocked` (section 5.4). A migration shows as failed only after the scheduler
 tried it, or when the newer definition has no `migrate`; inspection never runs
 one to find out. Blocked reasons are derived, never stored. Queued and placed
@@ -950,7 +1050,9 @@ joins task, tool, and hook invocations, including code that ignores its signal,
 then closes Storage. Once `close()` resolves, no invocation code of this Harness
 runs and no handler holds Storage, so a new Harness may open the same Storage.
 Already-running watch callbacks remain caller-owned and may finish
-independently. Close writes no task outcome. Cancelling a `close()` call cancels
+independently. Close writes no task outcome; it writes the tasks it stopped
+back as `pending`, so a reopen counts no restart for them (section 5.4).
+Cancelling a `close()` call cancels
 only that wait; shutdown continues, and every later `close()` awaits the same
 shutdown.
 
@@ -998,7 +1100,8 @@ type CommonDocDefinition<T extends JsonObject> = {
   readonly version: number;
   initial(): T;
   migrate?(value: JsonObject, fromVersion: number): T;
-  checkpointWhen?(value: Readonly<T>, ops: readonly Op[], info: CheckpointInfo): boolean;
+  /** Required, no default: whether this change is stored as a complete base (section 3.5). */
+  checkpointWhen(value: Readonly<T>, ops: readonly Op[], info: CheckpointInfo): boolean;
 };
 
 type DocDefinition<T extends JsonObject> =
@@ -1116,6 +1219,9 @@ Validation rules:
 - Task documents are current-only, are never copied by a conversation fork, and
   retire atomically when their task becomes terminal.
 - `initial()` and `migrate()` return JSON objects.
+- Every `defineDoc()` and `defineDocFamily()` definition supplies
+  `checkpointWhen`; there is no default. A definition that wants only the
+  required bases writes `checkpointWhen: () => false`.
 
 `checkpointWhen()` only selects complete storage bases to bound replay. It does
 not change scope, lifetime, history, or fork semantics.
@@ -1317,7 +1423,7 @@ alive at the target commit.
 
 ### 3.4 Mutation ownership
 
-Pico uses Chord Delta's Astra-immutable transaction shape directly:
+Durable uses Chord Delta's immutable transaction shape directly:
 
 ```ts
 interface Prepared<T extends object> {
@@ -1349,7 +1455,7 @@ operations, and computes `value` with the optimized immutable applier before
 Storage admission. Unchanged subtrees are structurally shared with `base`.
 Operation placement payloads may also be shared with `value`; mutating either a
 prepared operation or an immutable revision is unsupported. Astra preserves an
-empty operation batch for changes it proves are no-ops, but Pico performs no
+empty operation batch for changes it proves are no-ops, but Durable performs no
 additional whole-value equality pass for nonempty structural batches.
 
 `abort()` is idempotent. `adopt()` accepts only a prepared result from that
@@ -1439,7 +1545,7 @@ For an ordinary later mutation, the definition alone decides whether the
 storage record is a base:
 
 ```ts
-const useBase = definition.checkpointWhen?.(candidateValue, ops, { deltasSinceBase }) ?? false;
+const useBase = definition.checkpointWhen(candidateValue, ops, { deltasSinceBase });
 ```
 
 The Session evaluates this predicate exactly once after tracker preparation.
@@ -1576,17 +1682,17 @@ use, not by history: a document no watch or document state observes leaves it
 once it was not read or written for `documentRetentionMs` (default ten
 minutes; `0` drops it right after use), and the next access loads it from
 Storage. An observed document never leaves. Eviction runs on the mutation line,
-after each commit and when an unreferenced timer for the next expiry fires
-(the oldest idle document's, or sooner once the retention is shortened), so a
+after each commit and when a background timer (section 5.6) for the next expiry
+fires (the oldest idle document's, or sooner once the retention is shortened), so a
 transaction never loses a tracker it holds. A retention that is not a number of
 milliseconds, `0` or more, means the default; `Infinity` keeps documents. An
 observer pins the incarnation it observes, and releases it when that
-incarnation retires. Where timers cannot be
-unreferenced, as in Cloudflare Workers, only commits evict. A document that is
+incarnation retires. Where the host declines background timers, as the default
+does in Cloudflare Workers, only commits evict. A document that is
 used again and again moves to the back of the eviction order at most once per
 granule, a tenth of the retention up to one second. Task documents also retire
-with their task (section 5.5). `createSession(storage, { documentRetentionMs })`
-sets it for a plain Session; the Harness reads its settings at each use.
+with their task (section 5.5). `createSession(storage, { documentRetentionMs, setTimer })`
+sets them for a plain Session; the Harness reads its settings at each use.
 
 A Session commit callback may be asynchronous. It owns the Session mutation
 line through callback execution, preparation, storage settlement, committed
@@ -1660,6 +1766,8 @@ type TaskState<S, R> =
       readonly on: readonly TaskId[];
       readonly policy: JoinPolicy;
     }
+  /** Parked without an invocation until the Harness clock reaches `until`; then resumes at `checkpoint` (section 5.6). */
+  | { readonly status: "sleeping"; readonly checkpoint: S; readonly until: number }
   /** Outcome decided; terminal once no ordinary owned work below is live (section 5.5). Runs no more code. */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<R> }
   | { readonly status: "terminal"; readonly outcome: TaskOutcome<R> };
@@ -1685,9 +1793,11 @@ type TaskRecord<I, S, R> = {
   readonly startedAt?: number;
   /** Wall clock at the change to `terminal`. */
   readonly endedAt?: number;
+  /** Times in a row a crash cut it off without a state change since; a close does not count (section 5.4). */
+  readonly restarts?: number;
 } & (
   | {
-      readonly state: Extract<TaskState<S, R>, { status: "pending" | "running" | "waiting" }>;
+      readonly state: Extract<TaskState<S, R>, { status: "pending" | "running" | "waiting" | "sleeping" }>;
       readonly memos?: Readonly<Record<string, JsonValue>>;
     }
   | {
@@ -1704,7 +1814,7 @@ type RunningTask<I, S, R> = TaskRecord<I, S, R> & {
  * State a task commits for itself: a replacement checkpoint, a wait, or its outcome. A returned `terminal` state
  * becomes `completing` while ordinary owned work below is live (section 5.5).
  */
-type NextTaskState<S, R> = Extract<TaskState<S, R>, { status: "running" | "waiting" | "terminal" }>;
+type NextTaskState<S, R> = Extract<TaskState<S, R>, { status: "running" | "waiting" | "sleeping" | "terminal" }>;
 
 interface HookRunner<H extends object> {
   each<K extends keyof H>(name: K, invoke: (handler: NonNullable<H[K]>) => void | Promise<void>): Promise<void>;
@@ -1726,6 +1836,7 @@ interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver, Docum
   agent(context: Context): Promise<Agent>;
   /** `HarnessOptions.settings`, resolved at each access. */
   readonly settings: Settings;
+  /** `HarnessOptions.models`, resolved at each access. */
   readonly models: Models;
   readonly hooks: HookRunner<H>;
   /** Calls `HarnessOptions.env` for the task's conversation; rejects with its error. */
@@ -1760,8 +1871,15 @@ interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver, Docum
   /** The Harness clock. */
   now(): number;
   /** Forward a non-fatal failure to `HarnessOptions.onReport`. */
-  report(error: unknown): void;
-  sleep(until: number, context: Context): Promise<void>;
+  /** A `task_error`, or with `from` an `extension_error` or `host_error`, with this task (section 10.1). */
+  report(
+    error: unknown,
+    from?: { type: "extension"; extension?: string } | { type: "host"; callback: HostCallback },
+  ): void;
+  /** Commit `{ status: "sleeping", until, checkpoint }`; resolves once stored (section 5.6). */
+  sleepUntil(until: number, checkpoint: S, context: Context): Promise<void>;
+  /** A `HarnessOptions.setTimer` timer for pacing work in a phase; the invocation's end disarms it. */
+  setTimer(callback: () => void, delayMs: number): () => void;
 }
 
 type TaskDefinition<I, S extends { phase: string }, R, H extends object> = {
@@ -1817,10 +1935,11 @@ callback returns a state, the runtime replaces the task's state in the same
 commit, so the checkpoint or outcome is atomic with the callback's entries,
 documents, and child tasks and is type-checked against the task's checkpoint and
 result types. Returning nothing leaves the state unchanged. A terminal or
-completing state drops the memos. A `waiting` state ends the invocation even
-when its checkpoint is unchanged; it rejects when `on` names a missing task, the
-task itself, or a task on its owner chain, which could never finish first, and
-an empty `on` resumes at the next scheduling pass. `pending` is never returned;
+completing state drops the memos. A `waiting` or `sleeping` state ends the
+invocation even when its checkpoint is unchanged. A wait rejects when `on` names
+a missing task or closes a wait cycle (section 5.5), which no task on it could
+finish first, and an empty `on` resumes at the next scheduling pass; a sleep
+rejects an `until` that is not a time (section 5.6). `pending` is never returned;
 only reconciliation and handover write it.
 
 `Tx` has no task replacement operation. A task changes only its own state,
@@ -1847,9 +1966,11 @@ abort: async (task, runtime, context) => {
 },
 ```
 `memo(name, candidate)` is one gated commit; `memo(name)` reads the committed
-record. `sleep(until)` compares against the Harness `now` clock and rejects when
-the invocation is signalled or its context is cancelled. Watches acquired through
-the runtime stop when the invocation ends. `snapshot()`/`snapshotAsOf()` read
+record. A phase never waits for time in memory: `sleepUntil()` ends the phase
+with a durable sleep (section 5.6), and `setTimer()` only paces work inside a
+phase, such as progress commits; the invocation's end disarms its timers, and a
+call after its end arms nothing. Watches acquired through the runtime stop when
+the invocation ends. `snapshot()`/`snapshotAsOf()` read
 committed documents, for example to supply `PromptInput.read` (section 7.4).
 `getTask()` and `entry()` read committed records with one lookup each; `waitForTask()` waits for a terminal receipt,
 for example a child task created by a tool.
@@ -1858,14 +1979,14 @@ immutable entries off the line, like `Conversation.context()`. The scheduler kee
 each conversation's last range and view in memory: a later read by any of its tasks
 with the same head marker scans and derives only the entries after that range's tail.
 A conversation keeps them while busy and for `contextRetentionMs` once idle.
-Expiry is checked on task changes and by one unreferenced timer, which never keeps
-the process alive; where timers cannot be unreferenced, as in Cloudflare Workers,
-only task changes check it. Kept entries are frozen and each read returns its own
+Expiry is checked on task changes and by one background timer (section 5.6), which
+never keeps the process alive; where the host declines it, as the default does in
+Cloudflare Workers, only task changes check it. Kept entries are frozen and each read returns its own
 view arrays. Like every runtime operation, these
 reject after the invocation ends.
 
-Reservation durably changes `pending`, or `waiting` once it may resume, to
-`running`. One invocation runs phase
+Reservation durably changes `pending`, `waiting` once it may resume, or
+`sleeping` once due, to `running`. One invocation runs phase
 handlers in sequence; checkpoint commits retain `running`. Before every phase,
 including the first, the scheduler runs one step callback on the Session line.
 It reads the committed task and synchronously applies the first matching rule
@@ -1877,7 +1998,7 @@ invocation queued earlier therefore either lands before the step and counts, or
 reaches the line after it and rejects. Before the first phase only rules 1–3
 apply:
 
-1. Terminal, `completing`, or `waiting`: stop.
+1. Terminal, `completing`, `waiting`, or `sleeping`: stop.
 2. Session closing: stop; preserve the checkpoint and any abort mark for reopen.
 3. Run mode with a durable abort mark: end and join the run invocation; a fresh
    abort invocation starts once the task's ordinary owned work is no longer
@@ -1897,20 +2018,22 @@ again.
 
 On open, running-task reconciliation changes surviving `running` tasks back to
 `pending`, preserving their checkpoint and abort mark; `waiting` tasks stay
-waiting, and `completing` and `waiting` tasks are re-evaluated (section 5.5). Task migration runs at
-reservation, atomically with `pending` or `waiting` -> `running`. One callback handles every
+waiting and `sleeping` tasks asleep, and `completing` and `waiting` tasks are
+re-evaluated (section 5.5). Task migration runs at reservation, atomically with
+`pending`, `waiting`, or `sleeping` -> `running`. One callback handles every
 supported older version. A task whose definition is missing, older than the
-stored version, or fails migration stays `pending` or `waiting` and blocked until a fitting
+stored version, or fails migration stays `pending`, `waiting`, or `sleeping` and blocked until a fitting
 definition is installed or the task is aborted (section 5.4).
 `close()` marks the runtime closing, seals admission and reservation, signals
 invocations, and ends states and watches. Outside the Session line it settles admitted
 commits and joins invocations before closing storage. Already-running watch callbacks remain
-caller-owned. Later runtime commits reject, and close writes no task outcome. Closing
+caller-owned. Later runtime commits reject, and close writes no task outcome; after
+joining, it writes the tasks it stopped back as `pending`, straight to Storage, with
+nothing published. Closing
 starts no fresh phase or abort invocation. It does not set abort marks,
 terminalize tasks, retire task documents, or publish document retirement. The
-hosting layer withdraws services and
-detaches clients before it closes the Harness, for example by disposing its Chord
-facet host (see the Chord usage guide); reconnecting to a reopened Session
+hosting layer stops exposing Harness state to clients before it closes the
+Harness, for example by closing the Chord host whose objects serve it; reconnecting to a reopened Session
 hydrates the last committed state and resumes recovery from its durable
 checkpoints.
 
@@ -2054,6 +2177,7 @@ Every run invocation start resolves the task's definition by `TaskRecord.kind`
 from the scheduler's current registry snapshot:
 
 ```text
+restarts at restartLimit           -> stay pending, blocked: restart_limit
 definition missing                 -> stay pending, blocked: missing_task
 stored version newer than it       -> stay pending, blocked: task_too_old
 stored version older than it       -> migrate(input, checkpoint, storedVersion)
@@ -2062,18 +2186,44 @@ stored version older than it       -> migrate(input, checkpoint, storedVersion)
 equal version                       -> commit running
 ```
 
+**Restarts.** Open counts every surviving `running` task as cut off: it writes
+the task back as `pending` with `restarts` one higher. A close is not a crash:
+after joining the invocations it stopped, close writes those tasks back as
+`pending` without a count, so only a process that died, was evicted, or was
+reset leaves `running` records. A state the task commits
+itself that differs from its current one (a new checkpoint, a wait, a sleep, an
+outcome) is progress and removes the count; the same checkpoint committed again,
+memos, and document writes are not. Once `restarts` reaches
+`settings.restartLimit` (default 5; `Infinity` never parks), the task is parked:
+blocked with reason `restart_limit`, reported once as `task_parked` at the open
+that parks it, shown in `inspect()` and the task graph, and not active in
+`wake()`. Work that deterministically exhausts memory or CPU before its next
+checkpoint thus stops after a few attempts instead of running forever. Every
+task running when a process dies is counted, not only the one that killed it,
+so a long stream next to the culprit can be parked too; a host shows parked
+tasks and offers `Harness.retryTask(id)`, which removes the count and runs the
+task again, and does nothing for a task that is not parked. A run task that is
+parked keeps its conversation busy. An abort mark starts the count over and
+still runs a parked task's abort handler; an abort handler cut off
+`restartLimit` times is not run again, and the task ends `faulted` with detail
+`{ reason: "restart_limit" }`, reported as `task_faulted` with reason `restart_limit`.
+
 An abort invocation resolves the definition the same way. When the definition
 can take the task, its abort handler runs; otherwise the task is orphaned as
 described below.
 
-A failed migration is reported once through `onReport` and retried only after
+A failed migration is reported once as `migration_failed` and retried only after
 the registry resolves a different definition object for the task's kind.
 
 The Harness never terminalizes a task merely because registry code is missing or
 incompatible, neither at open nor later. A blocked task without an abort mark
 keeps its durable record unchanged, remains live, still blocks ordinary idle
 waits, and is reconsidered whenever the registry changes. The blocked reason is derived
-runtime state, not a persisted task status. Document migration remains
+runtime state, not a persisted task status. A blocked task is not active in
+`wake()` (section 5.6): only a registry change, or `retryTask()` for a parked
+one, can let it run, and either makes `onWake` report it active, so a host need
+not poll it. The task graph shows the reason and follows registry changes
+(section 9.5). Document migration remains
 access-driven.
 
 Aborting a blocked task cannot run its abort handler, because that code is
@@ -2149,7 +2299,7 @@ over: the step commits the task back to `pending` with its checkpoint, memos,
 and abort mark and ends the invocation, and the next reservation starts a fresh invocation under the new
 definition, applying the reservation rules above. When the definition is missing
 or cannot reserve the task, the invocation keeps running under its old
-definition, reports once through `onReport` per resolved definition, and
+definition, reports once as `task_outdated` per resolved definition, and
 reconsiders at its next boundary. A handler that
 never settles never hands over.
 
@@ -2215,8 +2365,17 @@ finish.
 The task stops without an invocation and resumes at `checkpoint` once every task
 in `on` is terminal. `on` may name any tasks, including already terminal ones;
 tasks the waiting task does not own, whose `owner` is not the waiting task,
-require `policy: "allSettled"`. `on` may not name a missing task, the task
-itself, or a task on its owner chain (section 5.1). With `failFast`, the first
+require `policy: "allSettled"`. `on` may not name a missing task or close a
+cycle in the wait-for graph (section 5.1), whose edges run from each task to the
+tasks it waits on and to its live ordinary owned work, which holds it as
+`completing`. A task waiting on itself, or on an owner that holds it, closes the
+shortest such cycles; a background task may wait on the owner of its
+conversation, which it does not hold. The check follows both kinds of edge from
+the tasks in `on`, visiting each task once, and the rejection names the cycle.
+Only durable waits are edges: a wait held only in memory, such as
+`runtime.waitForTask()` or a nested call's, is not checked. An abort-marked
+task waits only for its owned work, so its `on` is no edge.
+With `failFast`, the first
 task in `on` that holds or ends with a non-`completed` outcome gives every other
 live task in `on` an abort mark, in the scheduler's next reconcile commit. The waiting task itself is not marked:
 it resumes once all of `on` is terminal and reads their outcomes with
@@ -2242,6 +2401,83 @@ through `outcomes()`, and decides its own outcome. `abortTask(Checkout)` instead
 marks `Checkout`, the cascade marks the live payments, their abort handlers run
 first, then `Checkout.abort` runs and sees their final outcomes.
 
+### 5.6 Sleeping, timers, and wakeups
+
+**Sleeping.** A phase may commit `{ status: "sleeping", checkpoint, until }`, or
+call `runtime.sleepUntil(until, checkpoint, context)`, which commits exactly
+that. The task stops without an invocation and resumes at `checkpoint` once the
+Harness clock reaches `until`, epoch milliseconds on `HarnessOptions.now`.
+`sleepUntil()` resolves when the sleep is stored, not when the time comes; the
+phase returns right after. `until` must be a finite number, `0` or more; an
+abort handler cannot sleep. A sleep adds no wait-for edge. An abort mark ends
+it: the abort handler runs once the task's owned work drains, without waiting
+for `until`. Open keeps sleeping tasks asleep, and their deadlines survive any
+number of reopens.
+
+There is no sleep inside a phase: a phase reruns from its top after a crash or
+close, so an in-memory wait would hold an invocation, and a deadline computed
+inside the phase would move on every rerun. Work after a wait belongs in the
+next phase, with what it needs in the checkpoint:
+
+```ts
+work: async (task, runtime, context) => {
+  const a = await stepA();
+  await runtime.sleepUntil(runtime.now() + 10 * 60_000, { phase: "afterSleep", a }, context);
+},
+afterSleep: async (task, runtime, context) => {
+  const b = await stepB(task.state.checkpoint.a);
+  await runtime.commit(() => ({ status: "running", checkpoint: { phase: "next", b } }), context);
+},
+```
+
+Work before the sleep is not exactly-once: a crash before the sleep is stored
+reruns it (section 5.2). A sleep cannot be woken early except by an abort. A
+phase that runs before its time, as after an early wake of a built-in retry or
+poll, sleeps again with the same checkpoint (section 8.3).
+
+**Timers.** Every timer of the Session and Harness is armed through
+`HarnessOptions.setTimer` (default `setTimeout`). Background timers only free
+memory: document eviction (section 4) and kept contexts (section 5.1). A host
+may decline one by returning `undefined`; that memory is then freed at later
+commits and task changes. The default declines them in Cloudflare Workers, since
+a pending timer keeps a Durable Object from hibernating or being evicted even
+when `nodejs_compat` gives it an `unref()`, and wherever timers cannot be
+unreferenced. Foreground timers pace or resume work: throttled
+progress commits through `TaskRuntime.setTimer()`, and, without `onWake`, the
+timer for the earliest sleep while scheduling runs. That one keeps a Node.js
+process alive, since a sleeping task is work left to do. A timer should not fire
+early and may fire late; every caller checks its clock again when it fires. The
+default waits out a delay beyond what `setTimeout` supports in steps. A host that throws on or declines a foreground
+timer has it armed with `setTimeout` instead, and the first failure is reported.
+
+**Wakeups.** `Harness.wake()` says, from memory and also while scheduling is
+paused, when the Session next needs a running process:
+
+- `active`: some task can run now or is running: a pending task that is not
+  blocked, a running invocation, a waiting task whose `on` is settled, a due
+  sleep, or an abort-marked task whose owned work drained; also while a
+  reconcile pass (section 5.5) is scheduled or underway, such as open's
+  recovery, since it may finalize held outcomes and mark cascades. A host keeps a
+  recovery wakeup armed while it is set, so work cut off by a crash resumes.
+- `at`: the earliest sleep not yet due.
+
+Blocked tasks (section 5.4), `completing` tasks, and waits on live tasks count
+for neither; the work they wait for does. With `HarnessOptions.onWake`, the
+Harness arms no timer for sleeps. It calls `onWake` with `wake()` after open and
+whenever the value changes, off the Session line; a throw is reported. The host
+arms its own wakeup and calls `resume()` when it fires, which makes due sleeps
+runnable. A host whose process can be evicted, such as a Durable Object with
+its one alarm, arms the alarm at `at`, or at `now + heartbeat` while `active`
+if that is earlier, and deletes it when neither is set. `onWake` runs after the
+commit that changes the value, so a host call that can make an idle Session
+active arms the recovery wakeup first: `submit()`, `compact()`, `abortTask()`,
+`Conversation.abort()`, a registry change, and `resume()` after open. An early
+wakeup is harmless; a missing one leaves work stranded. A failed alarm write
+resets the object, which arms again when it next starts. Opening can fail too,
+for example in reconciliation: a host arms a fallback wakeup before
+`Harness.open`, unless an earlier one is set, so an object whose start throws is
+started again.
+
 ## 6. Submissions and inbox
 
 Submission records back awaitable host objects. Admission is Harness-internal;
@@ -2251,7 +2487,8 @@ wait in the built-in inbox document, an ordered list of tagged items:
 
 ```ts
 type InboxItem =
-  | { readonly id: SubmissionId; readonly mode: "steer" | "followUp"; readonly content: UserInput }
+  /** `entry` is the input's `InputEntry` (`kind` and optional `data`), present when given. */
+  | { readonly id: SubmissionId; readonly mode: "steer" | "followUp"; readonly content: UserInput; readonly entry?: InputEntry }
   /** `entry` is the write's `EntryDraft`, stored as plain JSON. */
   | { readonly id: SubmissionId; readonly mode: "write"; readonly entry: JsonObject };
 
@@ -2268,8 +2505,24 @@ type InboxState = { items: InboxItem[] };
 | view mount | `docs["pi.inbox"]` |
 | created | with every Harness conversation (section 2.2) |
 
-Items are in ID order. A queued input stores its content; its `pi.user` entry
-gets the Harness clock's timestamp at placement. Queued submissions belong to
+Items are in ID order. A queued input stores its content and its entry's kind
+and data; its entry gets the Harness clock's timestamp at placement.
+
+An input is placed as one entry whose `model` is the user message of its
+`content`: a `pi.user` entry, or, with `entry: { kind, data }`, an entry of that
+kind carrying that data. Only `kind` and `data` are taken from `entry`; admission
+rejects a kind that is not a non-empty string or starts with `pi.`. Nothing in
+the Harness reads input entries by kind; context, compaction, events, and run
+accounting go by `model` and the submission records.
+
+A write of only `kind` and `data`, with no `model`, `head`, or `edits` (present
+counts, even if empty), is display-only: it changes no model context, so admission
+appends it and settles it `done` in the same commit, busy or idle, ahead of
+earlier submissions still queued. Between a tool call and its result it changes
+nothing, because results are ordered by message. The one exception is a queued
+reset: appended before it, the entry would fall out of the context the reset
+starts, so a display-only write queues behind a queued reset and is placed after
+it at the same boundary. Queued submissions belong to
 their conversation, so a fork starts with an empty inbox.
 
 Run control lives in the built-in live document `pi.live` (section 8). Its
@@ -2288,12 +2541,13 @@ Admission and terminal transitions:
 | action | submission state | other writes |
 |---|---|---|
 | input, idle with empty inbox | `placed`, with user entry | create run and generation |
+| display-only write, no queued reset | `done`, with entry | append entry; no run |
 | write, idle with empty inbox | `done`, with entry | append entry; no run |
-| input or write, busy or non-empty inbox | `queued` | append inbox item |
+| input or other write, busy or non-empty inbox | `queued` | append inbox item |
 | boundary places user item | `placed`, with entry | add ID to current or successor run |
 | boundary places write | `done`, with entry | append entry |
 | run answers | input `done`, with required answer entry | remove `run`, or hand it to a successor |
-| run fails or its task aborts | input `unanswered`, with reason | remove `run`; inbox unchanged |
+| run fails or its task aborts | input `unanswered`, with reason | remove `run`; inbox per `afterFailedRun` below |
 | withdraw queued item | `unanswered`, reason `aborted` | remove inbox item |
 | stale head write | `unanswered`, reason `stale` | remove inbox item |
 
@@ -2302,9 +2556,19 @@ for the other submission type rejects. A busy input with `whenBusy: "reject"`
 writes no record and reports `ConversationBusy`. An idle input queues with mode
 `steer` when `whenBusy` is `steer` and `followUp` otherwise.
 
+`settings.afterFailedRun` decides what a run that fails with `model_error` or
+`no_model` does with the inputs queued behind it, in the commit that settles its
+own inputs: `keep` (the default) leaves them queued; `continue` applies the
+final boundary, so the next run starts with them, as after an answer;
+`withdraw` settles them `unanswered` with reason `run_failed`, keeping queued
+writes. A run whose task is aborted, faults, or is orphaned keeps its inbox.
+With `continue`, a cause that persists, such as a missing model, fails the next
+run too, so the queue drains one failed run per input.
+
 An idle conversation with a non-empty inbox, for example after a failed run,
-queues every new submission behind the waiting items and runs a final boundary
-in the same commit. Order is preserved: a follow-up queued before the failure is
+queues every new input and every write that is not display-only behind the
+waiting items and runs a final boundary in the same commit. A display-only write
+is appended without one, so a chat message never restarts failed work. Order is preserved: a follow-up queued before the failure is
 selected before the new input.
 
 A `Submission` waits until `done` or `unanswered`; abort withdraws only a still-
@@ -2366,7 +2630,7 @@ Only successful run ends apply the final boundary: an answer, `terminate`, or
 `handoff`. Failure, a run task's abort handler, fault, and orphan settle the
 run's inputs `unanswered` and leave the inbox alone (`Conversation.abort()`
 separately withdraws queued user items); the queued items stay visible in
-`pi.inbox` until the next submission's boundary or their withdrawal.
+`pi.inbox` until the next input or queued write runs a boundary, or their withdrawal.
 
 Selected and stale items are removed positionally while retained item order is
 preserved. Chord's Astra operation generator must express scattered removals
@@ -2618,12 +2882,13 @@ await conversation.configure({ extensions: { add: [Venv] } }, context);
 
 | reader | resolves | when |
 |---|---|---|
-| generation `prepare` | agent (tools, sections, model, thinking level), stream options, compaction thresholds | once per request; model, stream options, and offered tools are fixed in the request checkpoint (section 8.3) |
+| generation `prepare` | agent (tools, sections, model, thinking level), stream options, compaction thresholds for that model | once per request; model, stream options, and offered tools are fixed in the request checkpoint (section 8.3) |
 | every task phase | extension selection for hooks; `runtime.agent()` | at most once per phase handler, at its first hook dispatch or `agent()` call, from that phase's snapshot and the committed `pi.agent`, off the Session line, with the invocation's context; fixed for the rest of the phase |
 | tool task | the implementation of an accepted call | at `call` and `execute`: the name among the phase agent's `tools`, the current selection after the tools filter; no such tool, for example one removed after preparation: `tool_unavailable`. Replay policy on reopen uses the same lookup (section 7.3) |
 | generation, when a tool round starts | tool execution mode | once per round (section 8.3) |
 | generation, compaction | retry policy | at each attempt's classification |
-| compaction `select` | model, thinking level, stream options, compaction thresholds | once; the summary request stays pinned across its retries (section 8.7) |
+| generation, on a context overflow | compaction policy for the request's model | at classification |
+| compaction `select` | model, thinking level, stream options, compaction thresholds for that model | once; the summary request stays pinned across its retries (section 8.7) |
 | boundaries and idle admission, on the Session line | queue modes | per boundary (section 6) |
 | tool task, `prepare`, `runtime.env()` | environment | at each call (section 2.2) |
 
@@ -2665,6 +2930,7 @@ interface HookApi extends DocumentReader {
   readonly taskId: TaskId;
   readonly conversationId: ConversationId;
   /** `HarnessOptions.models`. */
+  /** The current `HarnessOptions.models`, read at each access. */
   readonly models: Models;
   memo<T extends JsonValue>(name: string, context: Context): Promise<T | undefined>;
   memo<T extends JsonValue>(name: string, candidate: T, context: Context): Promise<T>;
@@ -2743,6 +3009,7 @@ document holds that behavior's state:
 const PlanModeDoc = defineDoc<{ enabled: boolean }>({
   kind: "app.plan-mode", version: 1, scope: "conversation", history: "latest", fork: "current",
   initial: () => ({ enabled: false }),
+  checkpointWhen: () => false,
 });
 export const PlanMode = defineExtension({
   name: "plan-mode",
@@ -2804,9 +3071,12 @@ interface ToolExecutionApi<TDetails extends JsonValue = JsonValue> extends Docum
   /** The calling conversation's agent, as the tool task's phase resolved it. */
   agent(context: Context): Promise<Agent>;
   /** `HarnessOptions.models`: the catalog, credentials, and request transforms generation uses. */
+  /** The current `HarnessOptions.models`, read at each access. */
   readonly models: Models;
   /** Built by `HarnessOptions.env` for this call. */
   readonly env: ExecutionEnv | undefined;
+  /** The Harness clock, for times a rerun after a restart compares against. */
+  now(): number;
   output(chunk: string | Uint8Array): void;
   /** The output retained so far, as the model will see it, and whether earlier output was dropped. */
   retainedOutput(): { readonly text: string; readonly truncated: boolean };
@@ -2837,7 +3107,7 @@ interface ToolExecutionApi<TDetails extends JsonValue = JsonValue> extends Docum
 type NestedToolExecutionResult = {
   /** The nested call's tool task. */
   readonly taskId: TaskId;
-  /** A schema tool's validated `structuredOutput`, else its bounded output, collapsed (below). */
+  /** The tool's own value: a schema tool's validated `structuredOutput` (absent on an error result without one, whose text is then a `tool_error` diagnostic); a schema-less tool's bounded output, collapsed (below). */
   readonly structuredOutput?: JsonValue;
   readonly isError: boolean;
   readonly details?: JsonValue;
@@ -2965,12 +3235,18 @@ on an error result, where it may omit it; the Harness validates it after the
 programs get its bounded output, the content the model sees without the
 rendered diagnostics, for a success and for an error alike: one text item as
 its string, one image as its `ImageContent`, no items as `""`, and anything
-else as the content list. So a
-hook that redacts a schema-less tool's output redacts what programs get. An
+else as the content list. `structuredOutput` is always the tool's own value,
+never text the Harness makes: a schema tool's error result keeps the value it
+returned, and one without gives programs no `structuredOutput`; the text of its
+output becomes a `tool_error` diagnostic of the nested result instead, unless an
+error diagnostic already says what went wrong, so programs get it, for example
+`"permission denied: /etc"`. A thrown error's message is in its `tool_error`
+diagnostic too. So a hook that redacts a schema-less tool's output redacts
+what programs get. An
 error result the Harness writes itself (unavailable, invalid arguments,
 blocked, interrupted, aborted, abandoned, or a scheduler fault) has no
-`structuredOutput`; its diagnostics say what went wrong, as they do for a
-schema tool's error result without one. A nested call whose result breaks this gets an error result
+`structuredOutput`; its diagnostics say what went wrong. A thrown error
+becomes a `tool_error` diagnostic with its message. A nested call whose result breaks this gets an error result
 with an `invalid_structured_output` diagnostic, without the broken value: a
 schema tool's then has no `structuredOutput`, a schema-less tool's its output;
 a model-issued call, whose `structuredOutput` the model never sees, only loses
@@ -2990,6 +3266,19 @@ scripts cannot start scripts; tools behind code mode, such as MCP tools, can be
 narrows which of its model-callable tools the model is offered, for example
 only the code mode tool, while the others stay callable by tools. Neither can
 widen what `tools` enables.
+
+A `deferred` tool is not offered to the model until it is loaded: `modelTools`
+must name it, in its array or its `add`. Other tools can call it any time. A
+tool loads deferred tools with `control.addTools`, which writes their names to
+`modelTools` (section 8.5); since `pi.agent` is rewindable and forks as of the
+fork's entry, loaded tools are per branch, and a baseline after a head marker
+declares them, built from the resolved tools. Loaded tools follow the other
+tools in load order, so a load appends declarations to the transcript and the
+cached prefix holds. `@earendil-works/pi-durable/tool-search` provides the
+coding agent's `tool_search` (`createToolSearchExtension()`): it ranks
+`Agent.deferred` with BM25 over the tools' names, descriptions, and parameter
+names and descriptions, and loads the matches. The `codemode` section does not
+list deferred tools; scripts find them with `searchTools()`.
 
 Tools reach files and processes only through `api.env`, never through an
 environment captured when the tool was built. The tool task builds it for each
@@ -3100,7 +3389,13 @@ the newline count, the byte range of a span of lines, and the decoded sizes of
 that span and its first line, so a caller can count and locate lines without
 moving the file. `openDirReader`
 pages a directory in file-system order, reading metadata only for the entries
-it returns and skipping entries removed meanwhile. All operations stop when
+it returns and skipping entries removed meanwhile. The optional `listFiles`
+lists a whole tree for indexes such as file completion: files, directories and
+symbolic links (not followed), relative with `/` separators, depth first in
+byte order of names, without `.git` and, inside git work trees, without what
+git ignores; `maxEntries`, `maxBytes` and `timeoutMs` end it early with
+`truncated`. An environment that cannot list right now fails with
+`not_supported`, and callers fall back to their own walk. All operations stop when
 their context is aborted, and only that call's work stops: a timeout or abort
 kills only that command's processes. `cleanup()` kills every command the
 environment still runs and belongs to its owner's shutdown, never to a single
@@ -3360,9 +3655,9 @@ is not a lock against `bash` or other processes.
 
 ### 7.4 System prompt and dynamic tools
 
-Pico has no durable prompt sections. The conversation's resolved agent produces
+Durable has no durable prompt sections. The conversation's resolved agent produces
 the desired sections for each request; the transcript's `pi.system` entries are
-the only durable record of what the model saw. Pico stores prompt and tool
+the only durable record of what the model saw. Durable stores prompt and tool
 changes directly as PR #9548 `SystemMessage` values at their transcript
 positions, always with empty `content`:
 
@@ -3404,9 +3699,12 @@ Generation preparation takes these steps against its phase snapshot:
    append one positional `pi.system` entry when they differ.
 
 Preparation does not recheck the transcript before appending: only the Harness
-writes to a busy conversation, through submissions, run tasks, boundaries, and a
-blocking compaction, which appends only while its generation waits for it
-(section 8.7), so the transcript it read is still current (section 12).
+writes model context to a busy conversation, through submissions, run tasks,
+boundaries, and a blocking compaction, which appends only while its generation
+waits for it (section 8.7), so the context it read is still current (section 12).
+Display-only writes (section 6) may land meanwhile; they contribute no messages,
+and the system entry planning, the compaction threshold, and the request cutoff
+depend only on contributions and the newest entry ID.
 
 Model and thinking level are request options, not prompt state.
 
@@ -3482,7 +3780,7 @@ rebaseline adds every desired tool.
 The rendered strings stored in historical `SystemMessage.sections` remain
 authoritative even if the current renderer changes. Pi-ai decides whether to
 send the messages positionally to a capable provider or fold them into one
-leading system message; Pico does not rewrite its stored transcript for provider
+leading system message; Durable does not rewrite its stored transcript for provider
 compatibility.
 
 ### 7.5 Extension reload
@@ -3524,6 +3822,124 @@ Harness instances must never own the same Session concurrently: open the new one
 after the old one's `close()` resolved, when none of its invocation code runs
 any more (section 2.2).
 
+### 7.6 Code mode
+
+`@earendil-works/pi-durable/codemode` provides the `codemode` tool (`createCodemodeExtension({ sandbox })`):
+`callers: ["model"]`, `replay: "safe"`. Its argument is a script, run with
+pi-codemode's deterministic `sandbox.start()`. The script calls the agent's
+`callable` tools as `tools.<name>(args)`; each call is a nested call with key
+`c<id>`, the VM's own number for the call. As in the coding agent, a tool that
+declares `structuredOutputSchema` resolves with its `structuredOutput`, also on an
+error result that carries one (`bash` with a nonzero exit resolves with
+`{ output, exitCode, ... }`, which the script checks), and a schema-less tool
+resolves with its text output, images left out, as its declaration
+(`Promise<string>`) says. Every other error rejects, with the schema-less tool's
+text as message when it is not empty, else the error diagnostics' messages, and
+the value, if any, as `error.structuredOutput`. Which tools declare a schema is
+recorded in the start data, so a resumed script maps results as it began.
+
+The tool's description is fixed: the script environment and its globals. The
+extension's `codemode` prompt section lists the agent's `callable` tools as
+TypeScript declarations, grouped by `namespaces` (a tool belongs to the one with
+the longest matching name prefix), within an inline budget of 3000 estimated
+tokens: every namespace places its cheapest tool before any places a second,
+and what does not fit is said so and found with `searchTools()`. Scripts find
+tools with `ALL_TOOLS`, `searchTools(query, { limit?, namespace? })` (BM25),
+`describeTool(name)`, and `describeNamespace(name)`, answered from the start
+data and journaled like other globals. The result's content is a
+`Script completed`/`Script failed` header with the wall time since
+`startedAt`, the text items (`==> text N/M <==` when there are several), the
+`console` lines in one `<console_output>` block, the returned value, and on
+failure the error with the calls already made. Text past `max_output_tokens`
+(default 10000) keeps its start and end, the complete text written to a file
+(`details.fullOutputPath`); images are saved to files, their paths next to them.
+The Harness cuts a result past the tool's `outputLimits` (4 MiB, 100,000 lines)
+without such a file, so the text is also cut when it exceeds 1 Mi characters or
+the line limit, whatever `max_output_tokens` says. The files go to a temp
+directory of the environment that the run creates once and records in its run
+document (`outputDir`) before writing to it, under fixed names (`output.txt`,
+`image-<n>.<ext>`): a rerun after a crash overwrites them instead of adding new
+ones.
+
+With `models` (default on), scripts get the model catalog
+(`models.getModelsOfType`, `getAvailableOfType`, `getModelOfType`; journaled
+globals, configured `headers` removed) and `models.classify()` and
+`models.generateImages()`. Those two are paid effects, so each runs as an
+internal tool of the extension, `pi.codemode.models.classify` and
+`pi.codemode.models.generateImages` (`callers: ["tools"]`): the code mode tool
+turns the script's call of the global into a nested call of the tool, which then
+has its own task, live row, abort, usage accounting, and replay policy. Tools
+named `pi.codemode.*` are recorded in the start data as `hidden`: never in the
+section, `tools`, `ALL_TOOLS`, or tool search. They declare a schema, so like any
+such tool they resolve with the model's result whatever its `stopReason`, which
+the script checks; their rows show a failed one as an error. At most four such
+calls of one script run at once, and a call waiting for a slot when the script
+has ended is not started. A script that
+received generated images and showed none gets a note in its result. The tool's
+declaration carries the Lark grammar of the script source as
+`constrainedSampling`, which pi-ai applies for models that support it.
+
+The result's \`details\` list the script's tool calls in call order
+(\`CodemodeToolDetails\`: id, name, cut arguments, status \`ok\`/\`error\`/
+\`cancelled\`, duration, cut error), written once with the result; a call still
+running or not yet launched when the script ended is \`cancelled\`. While the
+script runs, UIs show its nested calls from \`pi.live.nestedTools\`.
+
+Three documents, two of them scoped to the code mode call's task:
+
+- `pi.codemode.run`: `start`, written once before the VM starts (module
+  version, `startedAt`, seed, the VM's fingerprint once reported, the deadline
+  from `timeout_ms`, the tools and globals the script sees, the store
+  snapshot), and `result`, the outcome, written once.
+- `pi.codemode.journal`: `entries`, one per result delivered to the VM, in
+  delivery order: the call's ID, the clock value, `issuedAfter` (the calls the VM
+  had issued after processing it, from its acknowledgment), and for a global its
+  name, arguments, and outcome; and `firstIssued`, the calls the VM had issued
+  after the script's first run.
+- `pi.codemode.store`: conversation-scoped, `history: "rewindable"`,
+  `fork: "asOf"`; a successful script's `store()` writes are applied per key in
+  the transaction that writes its `result`.
+
+Live, a finished call's result is appended to the journal and then delivered as
+result number `entry index + 1`, with the clock at the entry's time; one journal
+commit is in flight at a time and later results join the next. Acknowledged
+counts are recorded with the next journal commit, or at once when the VM has
+processed everything delivered. A call is launched only once the count of the
+drain that made it is committed, so every key an attempt admitted is at most its
+last recorded count.
+
+A run the sandbox ends as `aborted` without the call having asked for it (the
+host closed the sandbox, for example before closing the Harness) decides
+nothing: the call stores no outcome and ends with its invocation, so a later
+attempt replays the script.
+
+A rerun (`execute()` after recovery) returns a stored `result` without a VM.
+Otherwise it ends the call with a stored error result, admitting no new nested
+call, when the module version differs or the deadline passed; it starts the VM
+from `start` and does the same when the fingerprint the VM reports differs, before
+delivering or reattaching anything. It then delivers the journal in order, each
+entry once the VM has issued its call; a tool's result comes from its nested
+call by key, a global's from the journal after comparing name and arguments.
+Calls the journal does not have are held until the last journaled result is
+acknowledged. Divergence ends the call with a stored error result, then stops the
+VM with an error the script cannot catch: a count that differs from a recorded
+`issuedAfter`, a VM that waits without having issued the next entry's call, a
+key or global called with another name or arguments, or a script that ends while
+processing an entry whose `issuedAfter` was recorded (or during its first run
+with a non-empty journal), or before issuing a call that a later entry answers.
+A live call whose key an earlier attempt admitted with another tool or other
+arguments diverges the same way. Every recorded count, `firstIssued`
+included, must equal the replay's. On a rerun, live calls are held until the
+acknowledgment of the last journaled result, or of the first run when the
+journal is empty; by then the counts have matched, so the script has made every
+call an earlier attempt could have admitted. Every held call's key is checked
+against its stored nested call, whatever the call's target, and only when none
+differs are they launched; later calls are new. Nothing is admitted or delivered once the run
+has its outcome. A script that ends before using every entry
+is otherwise fine: the live run ended there too. A count the replay acknowledges
+but the journal lacks is recorded with the first live commit. Nested calls admitted before the restart may
+resume on their own whatever the rerun decides; the call's cleanup aborts them.
+
 ## 8. Built-in tasks
 
 The initial implementation provides:
@@ -3534,7 +3950,7 @@ The initial implementation provides:
 | `pi.tool` | validate, hook, execute, persist output and details, append result |
 | `pi.compaction` | select a transcript range, summarize, place a headed summary |
 
-Generation uses `HarnessOptions.models` without a Pico-specific model adapter. It
+Generation uses `HarnessOptions.models` without a Durable-specific model adapter. It
 resolves `models.getModel(ref.provider, ref.modelId)`, builds a pi-ai `Context`
 from the prepared prompt/messages/tools, and calls `models.streamSimple()` with
 the task invocation's abort signal, the agent's thinking level, and the
@@ -3638,6 +4054,18 @@ type LiveState = {
   }[];
   /** Live compaction tasks in task ID order; absent when none (section 8.7). */
   compactions?: CompactionStatus[];
+  /**
+   * The newest compaction failure since a compaction last produced a summary (section 8.7), so a client can show it
+   * after the task ended.
+   */
+  compactionFailure?: CompactionFailure;
+};
+
+type CompactionFailure = {
+  taskId: TaskId<CompactionResult>;
+  reason: CompactionReason;
+  /** The failed or faulted outcome's error message, or why the scheduler orphaned the task. */
+  error: string;
 };
 
 type CompactionStatus = {
@@ -3716,6 +4144,8 @@ type GenerationCheckpoint =
       compacted?: TaskId<CompactionResult>;
       /** Error text of the overflow that started `compacted`; checked once when `prepare` resumes. */
       overflow?: string;
+      /** Set when the blocking threshold started `compacted`; its outcome is checked once when `prepare` resumes. */
+      threshold?: true;
     }
   | {
       phase: "request";
@@ -3773,8 +4203,15 @@ The run's inputs live in `pi.live.run`, not in the task input.
   - Above `contextWindow - reserveTokens`, the blocking threshold: instead of
     appending, one commit creates a compaction owned by the generation with reason
     `threshold`, adds its status, and commits `waiting` on it with `allSettled`
-    and checkpoint `{ phase: "prepare", attempt, compacted }`. Whatever its
-    outcome, `prepare` then runs again and sends the request.
+    and checkpoint `{ phase: "prepare", attempt, compacted, threshold: true }`.
+    When `prepare` resumes, it reads the compaction's outcome once. If the
+    compaction completed, with or without a summary (nothing to compact, or
+    declined), `prepare` continues and sends the request. If it failed,
+    faulted, was orphaned, or was aborted directly, the generation fails with
+    `model_error` without a request, and its inputs settle `unanswered` with
+    detail `Compaction failed: <error>` (`Compaction was aborted` for an
+    abort). A failed compaction leaves a context above the blocking threshold,
+    where a request would at best leave no room for the answer.
   - Above `contextWindow - reserveTokens - backgroundTokens` with
     `backgroundTokens > 0` and no compaction status in `pi.live`: the commit that
     moves to `request` also creates a background compaction, owned by the
@@ -3825,17 +4262,20 @@ The run's inputs live in `pi.live.run`, not in the task input.
     the next threshold check handles silent overflow.
   - `error` that `isRetryableAssistantError()` accepts while the settings'
     retry policy allows another attempt (`enabled` and `attempt <= maxRetries`,
-    so `maxRetries` counts retries after the first attempt): append the error entry and move to
-    `retry` with `until = now + retryDelayMs(policy, attempt)`.
+    so `maxRetries` counts retries after the first attempt): append the error entry and sleep
+    (section 5.6) until `until = now + retryDelayMs(policy, attempt)` at `retry`.
   - any other `error`, or `aborted` without an abort mark: append the error
     entry, settle the inputs `unanswered` with `model_error`, remove `run` and
     `generation`, and fail.
-  - `deferred`: move to `poll` with `pollAt = now + (handle.pollAfterMs ?? 5000)`.
-- `retry` sleeps until `until`, then returns to `prepare` with the next attempt,
-  so agent and settings changes made during the backoff apply.
-- `poll` sleeps until `pollAt` and calls `models.fetchDeferred()`. A still
-  deferred result moves `pollAt` strictly later; any other result is classified
-  as above.
+  - `deferred`: sleep until `pollAt = now + (handle.pollAfterMs ?? 5000)` at `poll`.
+- `retry` runs once the backoff's sleep is due and returns to `prepare` with the
+  next attempt, so agent and settings changes made during the backoff apply.
+  Run before `until`, as a record of an earlier version that slept inside a
+  running `retry` phase is, it sleeps again with the same checkpoint.
+- `poll` runs once due and calls `models.fetchDeferred()`; run before `pollAt`,
+  it sleeps again. A still deferred result sleeps until a strictly later
+  `pollAt`; any other result is classified as above. A model gone after reopen
+  fails `no_model` once the poll is due.
 - The abort handler calls `models.cancelDeferred()` in `poll` when the model is
   known (a failure is reported), converts a committed partial, settles the inputs `unanswered` with
   `aborted`, removes `run` and `generation`, and ends `aborted`.
@@ -3937,9 +4377,12 @@ and then commits once:
 
 - It edits the conversation's stored `pi.agent` `tools` and `modelTools` for
   every `addTools` name: an array gets the name appended unless it holds it
-  already, and `{ remove }` loses the name. An unset filter already lets every
-  tool through, and nothing is written for it. The next preparation offers the
-  tool when it resolves and the model may call it.
+  already, and `{ remove }` loses the name. An unset `tools` already enables
+  every tool, and nothing is written for it. An unset or object `modelTools`
+  also gets the name appended to its `add`, which loads a deferred tool and has
+  no effect for others. Names are written without consulting the registry, so a
+  tool that is not registered now is offered once it is again. The next
+  preparation offers the tool when it resolves and the model may call it.
 - When every result of the round requests `terminate`, or any requests
   `handoff`, it appends the handoff's `pi.reset` entry, if any, settles the
   run's inputs `done` with the tool-calling answer, removes `run` and `tools`,
@@ -4082,9 +4525,11 @@ Phases:
   captured tail, and the cut as `firstKept`.
 - `summarize` derives the summarized messages again from the context at `tail`,
   which is immutable, and serializes them to text: `[User]: ...`,
-  `[Assistant thinking]: ...`, `[Assistant]: ...`,
-  `[Assistant tool calls]: name(key=json, ...)`, and `[Tool result]: ...`
-  truncated to 2000 characters; system messages are omitted. The request has no
+  `[Assistant]: ...`, `[Assistant tool calls]: name(key=json, ...)`, and
+  `[Tool result]: ...` truncated to 2000 characters; system messages and
+  thinking are omitted (replayed thinking is often not part of the live
+  context, so it could make the request larger than the context it
+  summarizes). The request has no
   tools and two messages: a system message with the built-in summarization
   system prompt, and a user message with the serialized text in
   `<conversation>` tags followed by the built-in summarization prompt, and
@@ -4098,12 +4543,12 @@ Phases:
   - `stop` with non-empty text and no tool call: the text is the summary, placed
     as below.
   - `error` that `isRetryableAssistantError()` accepts while the settings'
-    retry policy, read at classification, allows another attempt: move to `retry` with `until = now +
-    retryDelayMs(policy, attempt)`, and set the status's `attempt` and `retry`.
+    retry policy, read at classification, allows another attempt: sleep (section 5.6) until `until = now +
+    retryDelayMs(policy, attempt)` at `retry`, and set the status's `attempt` and `retry`.
   - anything else, including a `length` stop, which leaves the summary
     incomplete: fail with `model_error`.
-- `retry` sleeps until `until`, then returns to `summarize` with the next attempt
-  and the same pinned request.
+- `retry` runs once the sleep is due and returns to `summarize` with the next
+  attempt and the same pinned request; run before `until`, it sleeps again.
 
 The built-in prompts are the coding agent's structured checkpoint format. The
 prompt also asks the model to carry forward an earlier summary at the start of
@@ -4122,8 +4567,8 @@ the conversation.
 
 where `wrapped` is `"The conversation history before this point was compacted
 into the following summary:\n\n<summary>\n"`, the summary, and
-`"\n</summary>"`. The commit that places it also removes the task's status and
-commits the task's `completed` outcome:
+`"\n</summary>"`. The commit that places it also removes the task's status,
+removes `pi.live.compactionFailure`, and commits the task's `completed` outcome:
 
 - A blocking compaction appends the entry directly and completes with
   `{ entryId }`. Its generation holds the run and waits, so nothing else writes
@@ -4149,10 +4594,18 @@ aborted with its generation, before the generation's abort handler runs
 (section 5.5). A summary that is already queued is a write submission:
 conversation abort keeps it, and `Submission.abort()` withdraws it.
 
-When a blocking compaction ends without an `entryId`, because it found nothing
-to compact, was declined, failed, faulted, or was aborted directly, a threshold
-generation sends its request anyway and an overflow generation fails with
-`model_error` (section 8.3).
+**Failure.** The commit that fails a compaction (`model_error`, `no_model`)
+removes its status and sets `pi.live.compactionFailure` to its task, reason,
+and error message, replacing an older failure; the Harness cleanup does the
+same for a compaction the scheduler faults or orphans, with the fault's
+message or the orphan reason. Only a compaction that produces a summary
+removes it; one that is aborted or finds nothing to compact leaves it.
+
+When a blocking compaction ends without an `entryId`, an overflow generation
+fails with `model_error`. A threshold generation sends its request anyway
+when the compaction completed (it found nothing to compact or was declined),
+and fails with `model_error` when it failed, faulted, was orphaned, or was
+aborted directly (section 8.3).
 
 
 ## 9. Document observation and Chord
@@ -4228,11 +4681,11 @@ interface DocumentObserver {
 }
 ```
 
-`documentState()` attaches Pico's committed document stream to Chord before
+`documentState()` attaches Durable's committed document stream to Chord before
 returning. The returned state is already hydrated with the exact shareable
 immutable revision, has no mutation methods, and publishes every later exact
 committed revision and operation batch without another tracker, value copy, or
-re-diff. Disposing it unregisters only that observation; Pico remains the sole
+re-diff. Disposing it unregisters only that observation; Durable remains the sole
 document mutator.
 
 State and watch acquisition never create; absent lookup returns `undefined`.
@@ -4245,7 +4698,7 @@ Session close ends every state at its seal: the state keeps its last value and
 receives no frame from a commit that settles during close.
 
 Each document state assigns its own in-memory contiguous Chord delivery sequence.
-Pico does not persist or expose that sequence through `WatchHandle`. States and watches retain immutable revisions independently of the loaded tracker
+Durable does not persist or expose that sequence through `WatchHandle`. States and watches retain immutable revisions independently of the loaded tracker
 cache. Reopen creates a new state lifetime and hydration.
 
 Internally, state attachment uses Chord's synchronous atomic snapshot-and-register
@@ -4330,7 +4783,7 @@ type ConversationView = {
 ```
 
 These kinds and their fields are public protocol. Third-party documents are
-exposed through their own Chord services, not mounted.
+exposed through their own Chord objects, not mounted.
 
 The Harness keeps at most one mount per conversation. The first `viewState()`,
 `watch()`, or event attachment builds its revision on the Session line from the
@@ -4400,6 +4853,8 @@ type AgentEvent =
       nestedTools: readonly NestedToolSlot[];
       /** `pi.live.compactions` (section 8.2). */
       compactions: readonly CompactionStatus[];
+      /** `pi.live.compactionFailure` (section 8.2). */
+      compactionFailure?: CompactionFailure;
       inbox: readonly { id: SubmissionId; mode: InboxItem["mode"] }[];
       /** `pi.agent`; `{}` when absent. */
       agent: AgentState;
@@ -4433,7 +4888,7 @@ type AgentEvent =
   | { type: "task_failed"; taskId: TaskId; kind: string; message: string }
   | { type: "compaction_start"; taskId: TaskId; reason: CompactionReason; blocking: boolean }
   /** The task's receipt tells whether it produced a summary; the summary entry has its own events. */
-  | { type: "compaction_end"; taskId: TaskId; reason: CompactionReason };
+  | { type: "compaction_end"; taskId: TaskId; reason: CompactionReason; error?: string };
 
 /** One change to the in-flight assistant message, relative to that message. */
 type MessageChange =
@@ -4453,7 +4908,7 @@ interface AgentEventStream {
 ```
 
 Every event is relative to the `snapshot` and the events before it, never to
-Pico's document layout. `snapshot` replaces everything a consumer holds; every
+Durable's document layout. `snapshot` replaces everything a consumer holds; every
 other event applies on top of it. Attachment captures the snapshot and
 registers for later publications atomically on the Session line.
 
@@ -4507,8 +4962,9 @@ Events derive from committed changes:
   gains or drops `retry`, or gains `deferred` or moves its `pollAt`.
 - `task_failed`: a task of the conversation settles `faulted` or `orphaned`.
 - `compaction_start`/`compaction_end`: a status appears in or disappears from
-  `pi.live.compactions`. A retry backoff shows only in the snapshot's
-  `compactions`. A queued summary is placed later with its own
+  `pi.live.compactions`. `compaction_end` carries `error` when the same commit
+  recorded the task in `pi.live.compactionFailure`. A retry backoff shows only
+  in the snapshot's `compactions`. A queued summary is placed later with its own
   `message_start`/`message_end` and `submission` events.
 
 One commit produces one batch, in this order: `tool_execution_start`,
@@ -4546,6 +5002,8 @@ type TaskGraphState =
       readonly on: readonly TaskId[];
       readonly policy: JoinPolicy;
     }
+  /** Asleep until the Harness clock reaches `until` (section 5.6). */
+  | { readonly status: "sleeping"; readonly phase: string; readonly until: number }
   /** Outcome held until its ordinary owned work drains (section 5.5). */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<JsonValue>["status"] };
 
@@ -4560,6 +5018,8 @@ type TaskGraphNode = {
   readonly state: TaskGraphState;
   /** Conversations this task owns, in ID order. */
   readonly conversations: readonly ConversationId[];
+  /** Why it cannot run here, when it cannot (section 5.4); follows registry changes. */
+  readonly blocked?: "missing_task" | "task_too_old" | "migration_failed" | "restart_limit";
 };
 
 type TaskGraph = {
@@ -4580,9 +5040,11 @@ outcome payload, and memos: `phase` is the checkpoint's phase, `on` and
 `policy` are the stored wait, and `outcome` is the held outcome's status.
 `running` is the durable status: open changes surviving `running` tasks to
 `pending` (section 5.4), so they show as `pending` until the scheduler reserves
-them again, while `waiting` and `completing` tasks keep their status. Whether a
-pending task is blocked, and which of the tasks in `on` are still live, depend
-on the registry and the rest of the graph; `inspect()` derives them. A node is
+them again, while `waiting` and `completing` tasks keep their status. `blocked`
+is derived from the registry, the settings, and the record's `restarts`; the
+graph publishes a change of it also when only the registry changed or a
+migration failed. Which of the tasks in `on` are still live depends on the rest
+of the graph. A node is
 present from the commit that creates its task until the commit that makes the
 task terminal. Owner edges are immutable, so a node's `conversations` only grow
 while it lives.
@@ -4649,7 +5111,7 @@ type EntryQuery = {
 type TaskQuery = {
   readonly conversationId?: ConversationId;
   readonly kind?: string;
-  readonly status?: "pending" | "running" | "waiting" | "completing" | "terminal";
+  readonly status?: "pending" | "running" | "waiting" | "sleeping" | "completing" | "terminal";
   readonly abortRequested?: boolean;
   readonly background?: boolean;
   readonly order?: ScanOrder; // default ascending
@@ -4884,6 +5346,36 @@ listener throws ends with `listener_error`. A throwing or rejecting `onReport` i
 dropped, since nothing is left to report it to. A throwing `now()` is reported
 once, and `Date.now` serves instead.
 
+**Every report says what happened.** `onReport(error, info)` gets a
+`ReportInfo` whose `type` is one of:
+
+- `session_failed`: the error that failed the Session (a Storage error, often a
+  platform reset, or the Session's own bookkeeping);
+- `task_faulted`: a task ended `faulted`, because its phase threw (reason
+  `threw`) or its abort handler was cut off `restartLimit` times (reason
+  `restart_limit`);
+- `task_parked`: the restart limit parked a task (section 5.4);
+- `migration_failed`: a task's migration threw, and the task is blocked;
+- `task_outdated`: a running task keeps its old definition, which is missing
+  (`missing_task`) or cannot take the task (`incompatible_task`);
+- `task_error`: a task's own `runtime.report()`, or a failure running it;
+- `extension_error`: hooks, wrappers, system prompt sections, and a tool's
+  invalid structured output, with the task that ran them, or for a wrapper
+  outside a task the conversation whose agent was resolved;
+- `host_error`: a host callback, by its `HarnessOptions` name: `now`,
+  `settings`, `registry`, `env`, `models` for provider calls such as cancelling
+  a deferred response, `setTimer`, or `onWake`; with the task that called it,
+  if one did;
+- `listener_error`: a commit, close, watch, view, or document listener.
+
+Every task report carries `task` (its ID, kind, and conversation). `extension`
+names the extension whose code failed, when known. A task report names the
+extension that installed the definition the task ran, as of its reservation;
+built-in tasks have none. An `extension_error` names the hook's or the wrapper's
+extension, or the last selected extension that provides or wraps the section or
+tool. A host acts on reports outside the scheduler, for example
+counting faults of one task kind toward a breaker.
+
 ## 11. Backends
 
 ### 11.1 Memory
@@ -4903,7 +5395,9 @@ One SQL transaction is one Session commit. SQLite stores:
 - indexed document bases/deltas by document and commit sequence.
 
 Live task transitions replace one row. Terminal tasks remain as small records.
-Document reads use indexed base-plus-tail ranges. The first implementation stores
+Opening applies pending schema migrations in one transaction; schema version 2
+rebuilds the task table to admit the `sleeping` status. A database migrated by a
+newer version is refused by an older one. Document reads use indexed base-plus-tail ranges. The first implementation stores
 Chord records directly; it does not translate generic operations to SQLite JSON
 functions.
 
@@ -4979,7 +5473,8 @@ These are contracts, not invitations to add defensive machinery:
   use a write submission.
 - **Queued items after a failed run:** failure and task abort leave the inbox alone.
   Queued follow-ups wait in `pi.inbox`, and their `wait()` does not settle, until
-  the next submission's boundary places them or the host withdraws them. A
+  the next input or queued write's boundary places them or the host withdraws
+  them; a display-only write runs no boundary. A
   compaction summary is such a submission: when a manual or background
   compaction finishes in that idle conversation, its final boundary places the
   waiting follow-ups and starts a run.
@@ -5036,9 +5531,9 @@ These are contracts, not invitations to add defensive machinery:
 - **Family initialization:** the first acquisition of an absent family address
   selects its seed. Existing instances and later calls ignore seeds; a seed is
   neither identity nor an update.
-- **Checkpoint starvation:** if `checkpointWhen()` never returns true, replay
-  and current-only document storage can grow without bound while the document is
-  live.
+- **Checkpoint starvation:** if `checkpointWhen()` never returns true, as with
+  `() => false`, replay and current-only document storage can grow without bound
+  while the document is live.
 - **Wrong fork setting:** `current`, `initial`, and `asOf` are product semantics,
   not optimizations. Changing one changes child conversation behavior.
 - **Schema stability:** document kinds and visible mount paths are
@@ -5096,8 +5591,8 @@ These are contracts, not invitations to add defensive machinery:
 - **Non-cooperative code at close:** close joins every invocation. A task
   handler, tool, or hook that ignores its signal keeps `close()` pending and
   Storage open until it returns; cancelling the close wait does not end it.
-- **Services outliving the Harness:** withdraw Chord services and detach clients
-  before closing the Harness. A state ended by close keeps its last value and
+- **Objects outliving the Harness:** close the Chord objects and links that expose
+  Harness state before closing the Harness. A state ended by close keeps its last value and
   never updates again.
 - **Fatal storage errors:** after a storage error the Session has failed and
   closed itself; reopen it (section 10.1). Retrying the failed call cannot
@@ -5108,7 +5603,7 @@ These are contracts, not invitations to add defensive machinery:
 
 ## 13. Non-goals
 
-Pico5 initially has no:
+Durable has no:
 
 - whole-Session DOM;
 - visible-undurable publication;
@@ -5119,5 +5614,5 @@ Pico5 initially has no:
 - CRDT/offline multi-writer merge;
 - SQL translation of arbitrary Chord operations;
 - JSONL global compaction or automatic corruption repair;
-- compatibility layer for removed Pico prototypes;
+- compatibility layer for earlier harness prototypes;
 - forced termination of non-cooperative extension code inside one process.
