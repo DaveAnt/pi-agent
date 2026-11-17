@@ -51,3 +51,8 @@ packages/agent/docs/extensions/pi-server-artifact/index.md
 omni/pi-home/
 # OmniTeam 本地会话记录（运行时产物）
 omni/sessions/
+
+# 本仓根下的临时验证产物（场景 HTML / 探针标记），不是 pi-agent 源码
+scene.html
+ui-pi.txt
+*.tmp.html
